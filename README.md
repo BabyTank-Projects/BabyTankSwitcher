@@ -58,7 +58,7 @@ The **Client Viewer** tab shows live thumbnails of all your running clients.
 
 - **Thumbnails scale** automatically as you resize the window
 - **Click a thumbnail** to bring that client to the front
-- **Auto-minimize** sends the client back to the taskbar when you click away
+- **Auto-minimize** sends the client back to the taskbar when you click away (to truly minimize, you have to manually minimize the clients)
 - **+ Add Window** lets you manually add any window (failsafe for slow-loading clients)
 - Clients launched through the switcher are **auto-detected** — even if Microbot
   takes a while to fully load
