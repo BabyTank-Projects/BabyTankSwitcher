@@ -1,44 +1,69 @@
 @echo off
+cd /d "%~dp0"
 :: build.bat — Local build script for Baby Tank Switcher
-:: Run this to produce dist\BabyTankSwitcher.exe on your own machine.
+:: Targets Python 3.14 at C:\Python314
 
 echo ============================================
 echo  Baby Tank Switcher — Local Build
 echo ============================================
 echo.
 
-:: Check Python is available
-python --version >nul 2>&1
-if errorlevel 1 (
-    echo ERROR: Python not found on PATH.
-    echo Install Python 3.11+ from https://python.org
+:: ── Point explicitly at C:\Python314 ─────────────────────────────────────────
+set PYTHON=C:\Python314\python.exe
+
+:: Verify Python exists
+if not exist "%PYTHON%" (
+    echo ERROR: Python not found at C:\Python314\python.exe
+    echo Edit the PYTHON variable at the top of this script if installed elsewhere.
     pause
     exit /b 1
 )
 
-:: Install / update dependencies
+echo Using: %PYTHON%
+%PYTHON% --version
+echo.
+
+:: ── Step 1: Install / update dependencies ────────────────────────────────────
 echo [1/3] Installing dependencies...
-python -m pip install --upgrade pip --quiet
-pip install -r requirements.txt --quiet
-pip install pyinstaller --quiet
+%PYTHON% -m pip install --upgrade pip --quiet
+if errorlevel 1 echo WARNING: pip upgrade failed, continuing...
+
+%PYTHON% -m pip install -r requirements.txt --quiet
+if errorlevel 1 (
+    echo ERROR: Failed to install requirements.txt
+    pause
+    exit /b 1
+)
+
+:: Install latest PyInstaller pre-release for Python 3.14 support
+%PYTHON% -m pip install --upgrade --pre pyinstaller --quiet
+if errorlevel 1 (
+    echo ERROR: Could not install PyInstaller.
+    pause
+    exit /b 1
+)
 echo       Done.
 echo.
 
-:: Generate a dummy version_info.txt for local builds
+:: ── Step 2: Generate version_info.txt ────────────────────────────────────────
 echo [2/3] Generating version info...
-python -c ^
-"content=open('version_info.txt','w') if False else None; ^
-v='0.0.0'; ^
-parts=v.split('.')+['0']; ^
-vt=', '.join(parts[:4]); ^
-txt=f'''# UTF-8\nVSVersionInfo(\n  ffi=FixedFileInfo(\n    filevers=({vt}),\n    prodvers=({vt}),\n    mask=0x3f,flags=0x0,OS=0x40004,fileType=0x1,subtype=0x0,date=(0,0)\n  ),\n  kids=[\n    StringFileInfo([StringTable(u\"040904B0\",[StringStruct(u\"FileDescription\",u\"Baby Tank Switcher\"),StringStruct(u\"FileVersion\",u\"0.0.0\"),StringStruct(u\"ProductName\",u\"Baby Tank Switcher\"),StringStruct(u\"ProductVersion\",u\"0.0.0\")])]),\n    VarFileInfo([VarStruct(u\"Translation\",[1033,1200])])\n  ]\n)\n'''; ^
-open('version_info.txt','w').write(txt)"
+%PYTHON% generate_version_info.py 0.0.0
+if errorlevel 1 (
+    echo ERROR: Failed to generate version_info.txt
+    pause
+    exit /b 1
+)
 echo       Done.
 echo.
 
-:: Run PyInstaller
+:: ── Step 3: Build with PyInstaller ───────────────────────────────────────────
 echo [3/3] Building exe...
-pyinstaller BabyTankSwitcher.spec --noconfirm
+
+:: Create dist\ in advance to avoid permission issues
+if not exist dist mkdir dist
+
+:: Run PyInstaller as a Python module (avoids Scripts\ launcher issues on 3.14)
+%PYTHON% -m PyInstaller BabyTankSwitcher.spec --noconfirm
 if errorlevel 1 (
     echo.
     echo ERROR: Build failed. Check output above.
