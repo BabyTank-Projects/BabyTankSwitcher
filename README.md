@@ -36,7 +36,7 @@ No Python, no dependencies — just run the `.exe`.
 4. For each account:
    - Open Jagex Launcher → select the account → launch RuneLite/Microbot
    - Once it's loaded, switch back to Baby Tank Switcher
-   - Click **+ Add Account**, give it a name, tick *Save current credentials*, click Add
+   - Click **Import Account**
 5. From now on, click **Switch** to swap credentials or **▶ Launch** to swap + start the jar
 
 ---
