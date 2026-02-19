@@ -72,9 +72,9 @@ jobs:
             ## Baby Tank Switcher ${{ steps.version.outputs.tag }}
 
             ### Installation
-            1. Download `BabyTankSwitcher-v${{ steps.version.outputs.version }}.exe` below
+            1. Download the .exe below
             2. Run it — no Python or dependencies required
-            3. Windows may show a SmartScreen warning on first run — click **More info → Run anyway**
+            3. Windows SmartScreen warning on first run — click More info then Run anyway
 
             ### Requirements
             - Windows 10 / 11
