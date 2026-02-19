@@ -744,9 +744,12 @@ class AccountHandlerPage(ctk.CTkFrame):
     def _do_launch(self, acc):
         """Launch one account and notify viewer (runs in background thread)."""
         try:
-            sw.launch(acc, self.app.settings)
+            pid = sw.launch(acc, self.app.settings)
+            # Register PID immediately so the viewer knows which process to watch for.
+            # Java spawns child JVMs so we also track children in the scan.
+            self.app.viewer_page.register_launched_pid(pid)
             self.app.after(0, self.refresh)
-            for _ in range(6):
+            for _ in range(12):
                 time.sleep(5)
                 self.app.after(0, self.app.viewer_page.scan_for_new_clients)
         except sw.SwitcherError as e:
@@ -833,8 +836,9 @@ class ClientViewerPage(ctk.CTkFrame):
         self._fps         = 20
         self._ui_queue: queue.Queue = queue.Queue()
 
-        self._pid_to_hwnd: dict = {}   # pid -> hwnd for kill lookups
-        self._dismissed: set  = set()  # hwnds explicitly removed — never auto-add again
+        self._pid_to_hwnd: dict  = {}   # pid -> hwnd for kill lookups
+        self._dismissed: set   = set()  # hwnds explicitly removed — never auto-add again
+        self._launched_pids: set = set() # PIDs registered at launch time (root Java processes)
 
         # Dynamic thumbnail dimensions (recalculated on canvas resize)
         self._thumb_w = THUMB_W_DEFAULT
@@ -954,7 +958,9 @@ class ClientViewerPage(ctk.CTkFrame):
 
     def _start_threads(self):
         threading.Thread(target=self._capture_loop,          daemon=True).start()
-        threading.Thread(target=self._monitor_expanded,      daemon=True).start()
+        # NOTE: _monitor_expanded is intentionally NOT started.
+        # Clients stay in the foreground after clicking a thumbnail until the
+        # user manually minimizes them. No auto-minimize on focus change.
         threading.Thread(target=self._monitor_window_states, daemon=True).start()
         threading.Thread(target=self._monitor_cpu,           daemon=True).start()
         threading.Thread(target=self._auto_scan_loop,        daemon=True).start()
@@ -986,29 +992,25 @@ class ClientViewerPage(ctk.CTkFrame):
         time.sleep(5)
         while self._running:
             try:
-                # Snapshot the PIDs we care about
-                tracked_pids = dict(self._pid_to_hwnd)
-                if tracked_pids:
+                all_pids = self._get_all_tracked_pids()
+                if all_pids:
                     def cb(hwnd, _):
                         if not win32gui.IsWindowVisible(hwnd):
                             return True
                         title = win32gui.GetWindowText(hwnd)
                         if not title:
                             return True
-                        # Only care about windows whose PID we launched
                         try:
                             _, pid = win32process.GetWindowThreadProcessId(hwnd)
                         except Exception:
                             return True
-                        if pid not in tracked_pids:
+                        if pid not in all_pids:
                             return True
-                        # Skip dismissed and already-tracked
                         if hwnd in self._dismissed:
                             return True
                         with self._client_lock:
                             if hwnd in self._clients:
                                 return True
-                        # Keywords sanity-check (RuneLite fully loaded)
                         keywords = ("RuneLite", "Microbot", "Old School RuneScape")
                         if not any(k.lower() in title.lower() for k in keywords):
                             return True
@@ -1017,11 +1019,10 @@ class ClientViewerPage(ctk.CTkFrame):
                         self._pid_to_hwnd[pid] = hwnd
                         self._queue(self._add_card, hwnd, title, position)
                         return True
-
                     win32gui.EnumWindows(cb, None)
             except Exception:
                 pass
-            time.sleep(15)
+            time.sleep(10)
 
     def _show_add_window_dialog(self):
         """Show a dialog listing all visible windows so the user can manually add one."""
@@ -1139,37 +1140,58 @@ class ClientViewerPage(ctk.CTkFrame):
                       hover_color=BTN_GRAY2, command=dlg.destroy).pack(
             side="left", padx=6)
 
-    def scan_for_new_clients(self):
-        """Scan open windows for RuneLite/Microbot instances not yet tracked."""
-        def _do():
-            found = []
+    def register_launched_pid(self, pid: int):
+        """Call right after sw.launch() so we know which process tree to watch."""
+        if pid:
+            self._launched_pids.add(pid)
 
+    def _get_all_tracked_pids(self) -> set:
+        """Return launched PIDs plus all their children (Java spawns child JVMs)."""
+        all_pids = set(self._launched_pids)
+        for pid in list(self._launched_pids):
+            try:
+                for child in psutil.Process(pid).children(recursive=True):
+                    all_pids.add(child.pid)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        return all_pids
+
+    def scan_for_new_clients(self):
+        """Scan for windows belonging to processes we launched. Never auto-adds
+        anything the user opened themselves — use + Add Window for that."""
+        def _do():
+            all_pids = self._get_all_tracked_pids()
+            if not all_pids:
+                return
+            found = []
             def cb(hwnd, _):
                 if not win32gui.IsWindowVisible(hwnd):
                     return True
                 title = win32gui.GetWindowText(hwnd)
                 if not title:
                     return True
+                try:
+                    _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                except Exception:
+                    return True
+                if pid not in all_pids:
+                    return True
+                with self._client_lock:
+                    if hwnd in self._clients:
+                        return True
+                if hwnd in self._dismissed:
+                    return True
                 keywords = ("RuneLite", "Microbot", "Old School RuneScape")
-                if any(k.lower() in title.lower() for k in keywords):
-                    with self._client_lock:
-                        already = hwnd in self._clients
-                    if not already:
-                        try:
-                            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                        except Exception:
-                            pid = None
-                        found.append((hwnd, title, pid))
+                if not any(k.lower() in title.lower() for k in keywords):
+                    return True
+                found.append((hwnd, title, pid))
                 return True
-
             win32gui.EnumWindows(cb, None)
             for hwnd, title, pid in found:
                 with self._client_lock:
                     position = len(self._clients)
-                if pid:
-                    self._pid_to_hwnd[pid] = hwnd
+                self._pid_to_hwnd[pid] = hwnd
                 self._queue(self._add_card, hwnd, title, position)
-
         threading.Thread(target=_do, daemon=True).start()
 
     def remove_client_by_account(self, acc):
