@@ -3,35 +3,31 @@ name: Build & Release
 on:
   push:
     tags:
-      - 'v*.*.*'          # triggers on tags like v1.0.0, v1.2.3, etc.
-  workflow_dispatch:      # allows manual trigger from GitHub UI
+      - 'v*.*.*'
+  workflow_dispatch:
 
 permissions:
-  contents: write         # needed to create GitHub Releases
+  contents: write
 
 jobs:
   build:
-    runs-on: windows-latest   # must be Windows — pywin32 is Windows-only
+    runs-on: windows-latest
 
     steps:
-      # ── 1. Checkout source ────────────────────────────────────────────────
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── 2. Set up Python ─────────────────────────────────────────────────
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      # ── 3. Install dependencies ───────────────────────────────────────────
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
 
-      # ── 4. Extract version from tag (e.g. refs/tags/v1.2.3 → 1.2.3) ─────
       - name: Extract version
         id: version
         shell: bash
@@ -39,68 +35,22 @@ jobs:
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             VERSION="${GITHUB_REF#refs/tags/v}"
           else
-            VERSION="0.0.0-dev"
+            VERSION="0.0.0"
           fi
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
           echo "tag=v${VERSION}" >> $GITHUB_OUTPUT
 
-      # ── 5. Generate Windows version metadata file ─────────────────────────
       - name: Generate version_info.txt
-        shell: python
-        run: |
-          import os
-          version = os.environ.get('VERSION', '0.0.0')
-          parts = version.split('.')
-          while len(parts) < 4:
-              parts.append('0')
-          v = ', '.join(parts[:4])
+        run: python generate_version_info.py ${{ steps.version.outputs.version }}
 
-          content = f"""# UTF-8
-VSVersionInfo(
-  ffi=FixedFileInfo(
-    filevers=({v}),
-    prodvers=({v}),
-    mask=0x3f,
-    flags=0x0,
-    OS=0x40004,
-    fileType=0x1,
-    subtype=0x0,
-    date=(0, 0)
-  ),
-  kids=[
-    StringFileInfo([
-      StringTable(
-        u'040904B0',
-        [StringStruct(u'CompanyName', u'BabyTank Projects'),
-         StringStruct(u'FileDescription', u'Baby Tank Switcher'),
-         StringStruct(u'FileVersion', u'{version}'),
-         StringStruct(u'InternalName', u'BabyTankSwitcher'),
-         StringStruct(u'LegalCopyright', u''),
-         StringStruct(u'OriginalFilename', u'BabyTankSwitcher.exe'),
-         StringStruct(u'ProductName', u'Baby Tank Switcher'),
-         StringStruct(u'ProductVersion', u'{version}')])
-    ]),
-    VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
-  ]
-)
-"""
-          with open('version_info.txt', 'w') as f:
-              f.write(content)
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-
-      # ── 6. Build the exe with PyInstaller ────────────────────────────────
       - name: Build exe
         run: pyinstaller BabyTankSwitcher.spec
 
-      # ── 7. Rename output with version in filename ─────────────────────────
       - name: Rename artifact
         shell: bash
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          mv "dist/BabyTankSwitcher.exe" "dist/BabyTankSwitcher-v${VERSION}.exe"
+          mv "dist/BabyTankSwitcher.exe" "dist/BabyTankSwitcher-v${{ steps.version.outputs.version }}.exe"
 
-      # ── 8. Upload artifact (always — useful for manual/dev builds) ────────
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -108,7 +58,6 @@ VSVersionInfo(
           path: dist/BabyTankSwitcher-v${{ steps.version.outputs.version }}.exe
           retention-days: 30
 
-      # ── 9. Create GitHub Release (only on version tags) ───────────────────
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
@@ -117,7 +66,7 @@ VSVersionInfo(
           name: Baby Tank Switcher ${{ steps.version.outputs.tag }}
           draft: false
           prerelease: false
-          generate_release_notes: true    # auto-generates changelog from commits
+          generate_release_notes: true
           files: dist/BabyTankSwitcher-v${{ steps.version.outputs.version }}.exe
           body: |
             ## Baby Tank Switcher ${{ steps.version.outputs.tag }}
@@ -125,8 +74,8 @@ VSVersionInfo(
             ### Installation
             1. Download `BabyTankSwitcher-v${{ steps.version.outputs.version }}.exe` below
             2. Run it — no Python or dependencies required
-            3. Windows may show a SmartScreen warning on first run; click **More info → Run anyway**
+            3. Windows may show a SmartScreen warning on first run — click **More info → Run anyway**
 
             ### Requirements
             - Windows 10 / 11
-            - Java 17+ on your PATH (for launching Microbot/RuneLite)
+            - Java 17+ on your PATH (for launching Microbot / RuneLite)
