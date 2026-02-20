@@ -17,6 +17,30 @@ import psutil
 import config as cfg
 import switcher as sw
 
+# ── Favorites storage (per-account plugin favorites, local only) ──────────────
+
+_FAVORITES_FILE = cfg.APP_DATA_DIR / "favorites.json"
+
+def _load_favorites() -> dict:
+    """Load {account_id: [className, ...]} from disk. Returns {} on any error."""
+    try:
+        if _FAVORITES_FILE.exists():
+            import json as _json
+            return _json.loads(_FAVORITES_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+def _save_favorites(data: dict):
+    """Persist favorites dict to disk."""
+    try:
+        import json as _json
+        cfg.ensure_dirs()
+        _FAVORITES_FILE.write_text(
+            _json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
 # ── Theme ─────────────────────────────────────────────────────────────────────
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -675,6 +699,7 @@ class AccountHandlerPage(ctk.CTkFrame):
         super().__init__(parent, fg_color="transparent")
         self.app = app
         self._selected_id = None
+        self._launching   = False   # True while any launch is in progress
         self._build()
         self.refresh()
         self._tick()
@@ -706,12 +731,15 @@ class AccountHandlerPage(ctk.CTkFrame):
         bar.grid(row=2, column=0, sticky="ew")
         bar.grid_propagate(False)
 
-        ctk.CTkButton(bar, text="▶ Launch", width=100, height=34,
+        self._btn_launch = ctk.CTkButton(bar, text="▶ Launch", width=100, height=34,
                       font=FONT_SMALL, fg_color="#238636", hover_color="#2ea043",
-                      command=self._launch).pack(side="left", padx=(12, 4), pady=9)
-        ctk.CTkButton(bar, text="▶ Launch All", width=115, height=34,
+                      command=self._launch)
+        self._btn_launch.pack(side="left", padx=(12, 4), pady=9)
+
+        self._btn_launch_all = ctk.CTkButton(bar, text="▶ Launch All", width=115, height=34,
                       font=FONT_SMALL, fg_color="#1a5e2a", hover_color="#238636",
-                      command=self._launch_all).pack(side="left", padx=4, pady=9)
+                      command=self._launch_all)
+        self._btn_launch_all.pack(side="left", padx=4, pady=9)
         ctk.CTkButton(bar, text="■ Kill", width=80, height=34,
                       font=FONT_SMALL, fg_color="#6e2020", hover_color="#8b2a2a",
                       command=self._kill).pack(side="left", padx=4, pady=9)
@@ -776,6 +804,25 @@ class AccountHandlerPage(ctk.CTkFrame):
             return None
         return next((a for a in self.app.accounts if a.id == self._selected_id), None)
 
+    def _set_launch_locked(self, locked: bool, status_name: str = ""):
+        """Grey out / restore the Launch and Launch All buttons."""
+        self._launching = locked
+        if locked:
+            label = f"⏳ {status_name}…" if status_name else "⏳ Launching…"
+            self._btn_launch.configure(
+                state="disabled", fg_color=BTN_GRAY, hover_color=BTN_GRAY,
+                text=label)
+            self._btn_launch_all.configure(
+                state="disabled", fg_color=BTN_GRAY, hover_color=BTN_GRAY,
+                text="⏳ Waiting…")
+        else:
+            self._btn_launch.configure(
+                state="normal", fg_color="#238636", hover_color="#2ea043",
+                text="▶ Launch")
+            self._btn_launch_all.configure(
+                state="normal", fg_color="#1a5e2a", hover_color="#238636",
+                text="▶ Launch All")
+
     def _wait_for_login(self, acc, deadline: float) -> bool:
         """
         Poll every 2 s until loginState == LOGGED_IN or deadline passes.
@@ -809,7 +856,7 @@ class AccountHandlerPage(ctk.CTkFrame):
 
         return False
 
-    def _do_launch(self, acc, sequential=False):
+    def _do_launch(self, acc, sequential=False, unlock_when_done=False):
         """
         Launch one account. Runs in a background thread.
 
@@ -817,15 +864,19 @@ class AccountHandlerPage(ctk.CTkFrame):
         LOGGED_IN via HTTP before returning so the next credentials swap never
         clobbers this account mid-login. Falls back to 30 s if the plugin
         never responds (BabyTank HTTP Server not installed).
+
+        unlock_when_done=True: re-enables Launch / Launch All buttons after
+        this account confirms login (used by single Launch).
         """
         try:
+            # Update button label to show which account is logging in
+            self.app.after(0, lambda n=acc.display_name: self._set_launch_locked(True, n))
             sw.launch(acc, self.app.settings,
                       protect_process=self.app.settings.protect_process)
             self.app.after(0, self.refresh)
 
-            if sequential:
+            if sequential or unlock_when_done:
                 # Wait up to 3 minutes for LOGGED_IN confirmation.
-                # With the fast 0.1 s port timeout this loop is cheap to run.
                 logged_in = self._wait_for_login(acc, time.time() + 180)
                 if not logged_in:
                     # Plugin never responded — flat 30 s fallback so the
@@ -840,27 +891,48 @@ class AccountHandlerPage(ctk.CTkFrame):
         except FileNotFoundError:
             self.app.after(0, lambda: show_error(
                 "Java not found. Make sure Java 17 is installed and on your PATH."))
+        finally:
+            if unlock_when_done:
+                self.app.after(0, lambda: self._set_launch_locked(False))
 
     def _launch(self):
+        if self._launching:
+            return
         acc = self._get_selected()
         if not acc:
             return
-        threading.Thread(target=self._do_launch, args=(acc,), daemon=True).start()
+        # Lock immediately on the main thread before the background thread starts
+        self._set_launch_locked(True, acc.display_name)
+        threading.Thread(
+            target=self._do_launch,
+            args=(acc,),
+            kwargs={"unlock_when_done": True},
+            daemon=True).start()
 
     def _launch_all(self):
+        if self._launching:
+            return
         accounts = [a for a in self.app.accounts if not sw.is_running(a)]
         if not accounts:
             show_info("All accounts are already running.")
             return
         delay_ms = self._delay_spinner.get()
+        # Lock immediately before the thread starts
+        self._set_launch_locked(True, accounts[0].display_name)
 
         def _do():
-            for i, acc in enumerate(accounts):
-                if i > 0 and delay_ms > 0:
-                    time.sleep(delay_ms / 1000.0)
-                # sequential=True makes each launch wait for LOGGED_IN before
-                # writing the next account's credentials.properties
-                self._do_launch(acc, sequential=True)
+            try:
+                for i, acc in enumerate(accounts):
+                    # Update label for current account being launched
+                    self.app.after(0, lambda n=acc.display_name:
+                                   self._set_launch_locked(True, n))
+                    if i > 0 and delay_ms > 0:
+                        time.sleep(delay_ms / 1000.0)
+                    # sequential=True waits for LOGGED_IN before continuing.
+                    # unlock_when_done=False — we unlock once after the full loop.
+                    self._do_launch(acc, sequential=True, unlock_when_done=False)
+            finally:
+                self.app.after(0, lambda: self._set_launch_locked(False))
 
         threading.Thread(target=_do, daemon=True).start()
 
@@ -990,10 +1062,13 @@ class _ClientCard(ctk.CTkFrame):
         self.app          = app
         self.account      = account
         self._alive       = True
-        self._plugin_rows: dict = {}  # className -> (frame, btn)
+        self._plugin_rows: dict = {}  # className -> (frame, btn, star_btn)
         self._auto_port: int | None = None  # last port matched by central scan
         self._last_plugins: list = []  # last known plugin list for cross-referencing
         self._last_log: str = ""       # last console log message from /logs endpoint
+        # Favorites: set of plugin classNames starred by the local user for this account
+        all_favs = _load_favorites()
+        self._favorites: set = set(all_favs.get(account.id, []))
         self._build()
         if account.http_port:
             self._self_poll()
@@ -1086,7 +1161,7 @@ class _ClientCard(ctk.CTkFrame):
 
         self._world_v  = _cell(0, "WORLD")
         self._hp_v     = _cell(1, "HP")
-        self._run_v    = _cell(2, "RUN")
+        self._profit_v = _cell(2, "PROFIT")
         self._uptime_v = _cell(3, "UPTIME")
 
         ctrl = ctk.CTkFrame(self, fg_color=BG_MID, corner_radius=0)
@@ -1119,7 +1194,10 @@ class _ClientCard(ctk.CTkFrame):
             side="left", padx=12, pady=4)
         ctk.CTkButton(ph, text="↺ Reset All", width=80, height=20,
                       font=FONT_SMALL, fg_color=BTN_GRAY, hover_color=BTN_GRAY2,
-                      command=self._reset_all).pack(side="right", padx=8, pady=4)
+                      command=self._reset_all).pack(side="right", padx=(4, 8), pady=4)
+        ctk.CTkButton(ph, text="⟳ Reset Profit", width=94, height=20,
+                      font=FONT_SMALL, fg_color=BTN_GRAY, hover_color="#6e2020",
+                      command=self._reset_profit).pack(side="right", padx=(0, 4), pady=4)
 
         self._plug_frame = ctk.CTkScrollableFrame(
             self, fg_color=BG_TABLE, corner_radius=0,
@@ -1203,14 +1281,31 @@ class _ClientCard(ctk.CTkFrame):
             return
         self._last_log = ""
 
+    @staticmethod
+    def _fmt_profit(gp: int) -> tuple:
+        """Return (text, color) for a profit value in GP."""
+        if gp == 0:
+            return "0 gp", TEXT_SEC
+        sign  = "+" if gp > 0 else "-"
+        color = GREEN if gp > 0 else RED
+        val   = abs(gp)
+        if val >= 1_000_000:
+            text = f"{sign}{val / 1_000_000:.1f}m"
+        elif val >= 1_000:
+            text = f"{sign}{val / 1_000:.1f}k"
+        else:
+            text = f"{sign}{val:,} gp"
+        return text, color
+
     def _apply_status(self, data):
         if data is None:
             self._dot.itemconfig("dot", fill=TEXT_SEC)
             self._conn_lbl.configure(
                 text=f"{self.account.display_name}  (offline)",
                 text_color=TEXT_SEC)
-            for lbl in (self._world_v, self._hp_v, self._run_v, self._uptime_v):
+            for lbl in (self._world_v, self._hp_v, self._uptime_v):
                 lbl.configure(text="—", text_color=TEXT_PRI)
+            self._profit_v.configure(text="—", text_color=TEXT_SEC)
             self._script_lbl.configure(text="Script: —", text_color=TEXT_SEC)
             return
 
@@ -1219,35 +1314,36 @@ class _ClientCard(ctk.CTkFrame):
         self._conn_lbl.configure(
             text=f"{self.account.display_name}  ({player})", text_color=TEXT_PRI)
 
-        world  = data.get("world", 0)
-        hp     = data.get("hp", 0)
-        maxhp  = data.get("maxHp", 0)
-        run    = data.get("runEnergy", 0)
-        up     = data.get("uptimeSeconds", 0)
-        paused = data.get("paused", False)
-        script = data.get("scriptStatus", "IDLE")
+        world    = data.get("world", 0)
+        hp       = data.get("hp", 0)
+        maxhp    = data.get("maxHp", 0)
+        up       = data.get("uptimeSeconds", 0)
+        paused   = data.get("paused", False)
+        script   = data.get("scriptStatus", "IDLE")
+        profit   = data.get("profitGp", None)
 
         self._world_v.configure(text=str(world) if world else "—")
         self._hp_v.configure(
             text=f"{hp}/{maxhp}" if maxhp else "—",
             text_color=RED if maxhp and hp < maxhp * 0.3 else TEXT_PRI)
-        self._run_v.configure(text=f"{run}%")
         h, m, s = up // 3600, (up % 3600) // 60, up % 60
         self._uptime_v.configure(text=f"{h}h {m}m" if h else f"{m}m {s}s")
 
+        if profit is not None:
+            txt, col = self._fmt_profit(int(profit))
+            self._profit_v.configure(text=txt, text_color=col)
+        else:
+            # Older plugin version without profitGp — show dash
+            self._profit_v.configure(text="—", text_color=TEXT_SEC)
+
         if paused:
-            # Always show paused state clearly
             self._script_lbl.configure(text="Script: ⏸ PAUSED", text_color="#FFA500")
             return
 
-        # Prefer the last console log message (from /logs) if available
         if self._last_log:
-            self._script_lbl.configure(
-                text=f"Script: {self._last_log}",
-                text_color=GREEN)
+            self._script_lbl.configure(text=f"Script: {self._last_log}", text_color=GREEN)
             return
 
-        # Fall back: use scriptStatus from /status, with drop-party detection
         display_script = script
         if script in ("IDLE", ""):
             drop_party_active = any(
@@ -1260,9 +1356,22 @@ class _ClientCard(ctk.CTkFrame):
                 display_script = "DROP PARTY"
 
         color = GREEN if display_script not in ("IDLE", "") else TEXT_SEC
-        self._script_lbl.configure(
-            text=f"Script: {display_script}",
-            text_color=color)
+        self._script_lbl.configure(text=f"Script: {display_script}", text_color=color)
+
+    # ── Favorites ─────────────────────────────────────────────────────────────
+
+    def _toggle_favorite(self, cls: str):
+        """Star/unstar a plugin and persist to disk, then re-render plugin list."""
+        if cls in self._favorites:
+            self._favorites.discard(cls)
+        else:
+            self._favorites.add(cls)
+        # Persist: load full file, update this account's entry, save
+        all_favs = _load_favorites()
+        all_favs[self.account.id] = list(self._favorites)
+        _save_favorites(all_favs)
+        # Re-render with current plugin data so order + star colour updates
+        self._apply_plugins(self._last_plugins)
 
     def _apply_plugins(self, data):
         bot_plugins = [p for p in (data or [])
@@ -1270,7 +1379,7 @@ class _ClientCard(ctk.CTkFrame):
         self._last_plugins = data or []  # store all plugins for cross-referencing
 
         if not bot_plugins:
-            for _, (row, _btn) in list(self._plugin_rows.items()):
+            for _, (row, _btn, _star) in list(self._plugin_rows.items()):
                 row.destroy()
             self._plugin_rows.clear()
             self._empty_plug.grid(row=0, column=0, pady=24)
@@ -1279,10 +1388,20 @@ class _ClientCard(ctk.CTkFrame):
         self._empty_plug.grid_remove()
         seen = set()
 
-        for idx, plug in enumerate(bot_plugins):
-            cls    = plug.get("className", "")
-            name   = plug.get("name", cls.split(".")[-1])
-            active = plug.get("active", False)
+        # Sort: favorites first (sorted by name), then rest (sorted by name)
+        fav_plugins  = sorted(
+            [p for p in bot_plugins if p.get("className", "") in self._favorites],
+            key=lambda p: p.get("name", p.get("className", "")).lower())
+        rest_plugins = sorted(
+            [p for p in bot_plugins if p.get("className", "") not in self._favorites],
+            key=lambda p: p.get("name", p.get("className", "")).lower())
+        ordered = fav_plugins + rest_plugins
+
+        for idx, plug in enumerate(ordered):
+            cls       = plug.get("className", "")
+            name      = plug.get("name", cls.split(".")[-1])
+            active    = plug.get("active", False)
+            is_fav    = cls in self._favorites
             seen.add(cls)
 
             bg        = BG_ROW if idx % 2 == 0 else BG_TABLE
@@ -1290,21 +1409,30 @@ class _ClientCard(ctk.CTkFrame):
             btn_text  = "■ Stop"  if active else "▶ Start"
             btn_fg    = "#6e2020" if active else "#1a5e2a"
             btn_hov   = "#8b2a2a" if active else "#238636"
+            star_char = "★" if is_fav else "☆"
+            star_fg   = "#f0c040" if is_fav else BTN_GRAY
 
             if cls in self._plugin_rows:
-                row_frame, btn = self._plugin_rows[cls]
-                btn.configure(text=btn_text, fg_color=btn_fg,
-                              hover_color=btn_hov,
-                              command=lambda c=cls, a=active: self._toggle(c, a))
+                row_frame, btn, star_btn = self._plugin_rows[cls]
+                # Reposition row in case sort order changed
+                row_frame.grid(row=idx, column=0, sticky="ew")
+                # Update dot
                 children = row_frame.winfo_children()
                 if children:
                     children[0].itemconfig("dot", fill=dot_color)
+                btn.configure(text=btn_text, fg_color=btn_fg,
+                              hover_color=btn_hov,
+                              command=lambda c=cls, a=active: self._toggle(c, a))
+                star_btn.configure(text=star_char, fg_color=star_fg,
+                                   hover_color="#c8a020" if is_fav else BTN_GRAY2,
+                                   text_color="#1a1a1a" if is_fav else TEXT_PRI,
+                                   command=lambda c=cls: self._toggle_favorite(c))
             else:
                 row_frame = ctk.CTkFrame(self._plug_frame, fg_color=bg,
                                           corner_radius=0, height=34)
                 row_frame.grid(row=idx, column=0, sticky="ew")
                 row_frame.grid_propagate(False)
-                row_frame.grid_columnconfigure(1, weight=1)
+                row_frame.grid_columnconfigure(2, weight=1)  # name column expands
 
                 dot = tk.Canvas(row_frame, width=10, height=10,
                                 bg=bg, highlightthickness=0)
@@ -1312,16 +1440,26 @@ class _ClientCard(ctk.CTkFrame):
                                 outline="", tags="dot")
                 dot.grid(row=0, column=0, padx=(10, 4), pady=12)
 
+                # Star button (column 1, before name)
+                star_btn = ctk.CTkButton(
+                    row_frame, text=star_char, width=26, height=22,
+                    font=("Segoe UI", 12), fg_color=star_fg,
+                    hover_color="#c8a020" if is_fav else BTN_GRAY2,
+                    text_color="#1a1a1a" if is_fav else TEXT_PRI,
+                    corner_radius=4, border_width=0,
+                    command=lambda c=cls: self._toggle_favorite(c))
+                star_btn.grid(row=0, column=1, padx=(0, 6), pady=6)
+
                 ctk.CTkLabel(row_frame, text=name, font=FONT_SMALL,
                              text_color=TEXT_PRI, anchor="w").grid(
-                    row=0, column=1, sticky="w", padx=4)
+                    row=0, column=2, sticky="w", padx=4)
 
                 btn = ctk.CTkButton(
                     row_frame, text=btn_text, width=68, height=22,
                     font=FONT_SMALL, fg_color=btn_fg, hover_color=btn_hov,
                     command=lambda c=cls, a=active: self._toggle(c, a))
-                btn.grid(row=0, column=2, padx=8)
-                self._plugin_rows[cls] = (row_frame, btn)
+                btn.grid(row=0, column=3, padx=8)
+                self._plugin_rows[cls] = (row_frame, btn, star_btn)
 
         for cls in list(self._plugin_rows):
             if cls not in seen:
@@ -1430,7 +1568,7 @@ class _ClientCard(ctk.CTkFrame):
         p = self._port()
         if not p:
             return
-        active = [cls for cls, (_, btn) in self._plugin_rows.items()
+        active = [cls for cls, (_, btn, _star) in self._plugin_rows.items()
                   if btn.cget("text") == "■ Stop"]
         if not active:
             return
@@ -1446,6 +1584,26 @@ class _ClientCard(ctk.CTkFrame):
             plugins = _http_get(p, "/plugins") or []
             self.after(0, lambda: self._apply_status(status))
             self.after(0, lambda: self._apply_plugins(plugins))
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _reset_profit(self):
+        """POST /profit/reset to zero out the session profit counter on the client."""
+        p = self._port()
+        if not p:
+            show_error("Client is offline — cannot reset profit.")
+            return
+
+        def _bg():
+            ok = _http_post(p, "/profit/reset")
+            if ok:
+                # Immediately reflect zero in UI
+                self.after(0, lambda: self._profit_v.configure(
+                    text="0 gp", text_color=TEXT_SEC))
+            else:
+                self.after(0, lambda: show_error(
+                    "Could not reach client.\n"
+                    "Make sure the BabyTank HTTP Server plugin is running."))
 
         threading.Thread(target=_bg, daemon=True).start()
 
