@@ -5,18 +5,13 @@ __pycache__/
 *.pyd
 .Python
 *.egg-info/
-dist/
-build/
 *.egg
 
 # PyInstaller
-*.spec.bak
 dist/
 build/
+*.spec.bak
 *.manifest
-
-# Generated files
-version_info.txt
 
 # Virtual environments
 .venv/
