@@ -165,6 +165,7 @@ class Account:
     client_args: ClientArgs = field(default_factory=ClientArgs)
     notes: str = ""
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    http_port: int = 0  # BabyTank HTTP Server port (0 = not configured)
 
     def to_dict(self):
         d = {
@@ -173,6 +174,7 @@ class Account:
             "client_args": self.client_args.to_dict(),
             "notes": self.notes,
             "id": self.id,
+            "http_port": self.http_port,
         }
         return d
 
@@ -192,15 +194,17 @@ class Account:
             client_args=client_args,
             notes=d.get("notes", ""),
             id=d.get("id", str(uuid.uuid4())),
+            http_port=d.get("http_port", 0),
         )
 
 
 @dataclass
 class Settings:
-    runelite_folder: str = field(default_factory=_detect_runelite_folder)
-    config_location: str = field(default_factory=_detect_config_location)
-    jar_path: str = ""
-    jvm_args: str = "-Xmx512m"
+    runelite_folder: str  = field(default_factory=_detect_runelite_folder)
+    config_location: str  = field(default_factory=_detect_config_location)
+    jar_path: str         = ""
+    jvm_args: str         = "-Xmx512m"
+    protect_process: bool = False  # Apply Windows process hardening on launch (requires admin)
 
     def to_dict(self):
         return asdict(self)
@@ -208,10 +212,11 @@ class Settings:
     @staticmethod
     def from_dict(d: dict) -> "Settings":
         return Settings(
-            runelite_folder=d.get("runelite_folder", _detect_runelite_folder()),
-            config_location=d.get("config_location", _detect_config_location()),
-            jar_path=d.get("jar_path", ""),
-            jvm_args=d.get("jvm_args", "-Xmx512m"),
+            runelite_folder  = d.get("runelite_folder", _detect_runelite_folder()),
+            config_location  = d.get("config_location", _detect_config_location()),
+            jar_path         = d.get("jar_path", ""),
+            jvm_args         = d.get("jvm_args", "-Xmx512m"),
+            protect_process  = d.get("protect_process", False),
         )
 
     @property
