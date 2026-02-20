@@ -4,13 +4,13 @@ switcher.py - Core logic: save/switch credentials, launch, kill.
 Process protection (optional, requires admin):
   When enabled, launched Java processes are hardened against detection:
   1. Launched with CREATE_BREAKAWAY_FROM_JOB so they're detached from any
-     job object Baby Tank Switcher itself may be in (e.g. if run from a
-     terminal that uses job objects).
-  2. A restrictive DACL is applied immediately after launch — external
-     processes (including the Jagex client) are denied PROCESS_VM_READ and
-     PROCESS_QUERY_INFORMATION so they cannot inspect the process.
+     job object Baby Tank Switcher itself may be in.
+  2. A restrictive DACL is applied — external processes are denied
+     PROCESS_VM_READ and PROCESS_QUERY_INFORMATION so they cannot inspect
+     the process. Baby Tank Switcher itself retains full access via an
+     explicit ACE so it can still track/kill the process.
   3. The parent-process relationship is broken by re-assigning the process
-     to a new Job Object, making it appear to have been spawned independently.
+     to a new Job Object.
 """
 
 import ctypes
@@ -34,34 +34,41 @@ _running: dict = {}
 
 # ── Windows API constants ──────────────────────────────────────────────────────
 
-# Access rights
 PROCESS_ALL_ACCESS              = 0x1FFFFF
 PROCESS_QUERY_INFORMATION       = 0x0400
 PROCESS_VM_READ                 = 0x0010
 PROCESS_TERMINATE               = 0x0001
 PROCESS_SUSPEND_RESUME          = 0x0800
 
-# CreateProcess flags
 CREATE_NO_WINDOW                = 0x08000000
 CREATE_SUSPENDED                = 0x00000004
 CREATE_BREAKAWAY_FROM_JOB       = 0x01000000
 
-# Security descriptor / ACL
 SE_KERNEL_OBJECT                = 6
 DACL_SECURITY_INFORMATION       = 0x00000004
-OBJECT_INHERIT_ACE              = 0x01
-CONTAINER_INHERIT_ACE           = 0x02
-ACCESS_DENIED_ACE_TYPE          = 0x01
 SECURITY_DESCRIPTOR_REVISION    = 1
 ACL_REVISION                    = 2
+
+# ACE types / flags
+ACCESS_ALLOWED_ACE_TYPE         = 0x00
+ACCESS_DENIED_ACE_TYPE          = 0x01
+OBJECT_INHERIT_ACE              = 0x01
+CONTAINER_INHERIT_ACE           = 0x02
+
+# Specific deny mask for external processes
+DENY_MASK = PROCESS_VM_READ | PROCESS_QUERY_INFORMATION
 
 # Job object
 JobObjectBasicUIRestrictions    = 4
 JOB_OBJECT_UILIMIT_HANDLES      = 0x00000001
 
-# Token elevation
+# Token / SID
 TOKEN_QUERY                     = 0x0008
-TokenElevation                  = 20
+TokenUser                       = 1
+
+# Well-known SID for "Everyone" (World)
+SECURITY_WORLD_SID_AUTHORITY    = (0, 0, 0, 0, 0, 1)
+SECURITY_WORLD_RID              = 0
 
 # ── Structures ─────────────────────────────────────────────────────────────────
 
@@ -87,6 +94,7 @@ class STARTUPINFO(ctypes.Structure):
         ("hStdError",       wt.HANDLE),
     ]
 
+
 class PROCESS_INFORMATION(ctypes.Structure):
     _fields_ = [
         ("hProcess",    wt.HANDLE),
@@ -95,39 +103,81 @@ class PROCESS_INFORMATION(ctypes.Structure):
         ("dwThreadId",  wt.DWORD),
     ]
 
+
 class JOBOBJECT_BASIC_UI_RESTRICTIONS(ctypes.Structure):
     _fields_ = [("UIRestrictionsClass", wt.DWORD)]
+
 
 # ── Admin check ────────────────────────────────────────────────────────────────
 
 def is_admin() -> bool:
-    """Return True if the current process is running with admin privileges."""
     try:
         return ctypes.windll.shell32.IsUserAnAdmin() != 0
     except Exception:
         return False
 
 
+# ── Get current process SID ────────────────────────────────────────────────────
+
+def _get_current_user_sid():
+    """
+    Return a PSID (ctypes pointer) for the current user's SID,
+    or None on failure. Caller must free with LocalFree().
+    """
+    advapi = ctypes.windll.advapi32
+    k32    = ctypes.windll.kernel32
+
+    token = wt.HANDLE()
+    if not k32.OpenProcessToken(k32.GetCurrentProcess(), TOKEN_QUERY,
+                                ctypes.byref(token)):
+        return None
+
+    # Get required buffer size
+    needed = wt.DWORD(0)
+    advapi.GetTokenInformation(token, TokenUser, None, 0, ctypes.byref(needed))
+    buf = ctypes.create_string_buffer(needed.value)
+    ok  = advapi.GetTokenInformation(token, TokenUser, buf, needed, ctypes.byref(needed))
+    k32.CloseHandle(token)
+    if not ok:
+        return None
+
+    # TOKEN_USER starts with a SID_AND_ATTRIBUTES; first field is the SID pointer
+    sid_ptr = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
+
+    # Duplicate the SID so it survives beyond buf's lifetime
+    sid_len = advapi.GetLengthSid(sid_ptr)
+    sid_copy = ctypes.create_string_buffer(sid_len)
+    advapi.CopySid(sid_len, sid_copy, sid_ptr)
+    return sid_copy
+
+
+def _get_everyone_sid():
+    """Return a ctypes buffer containing the well-known Everyone SID."""
+    advapi = ctypes.windll.advapi32
+    sia    = (ctypes.c_byte * 6)(0, 0, 0, 0, 0, 1)   # SECURITY_WORLD_SID_AUTHORITY
+    sid    = ctypes.c_void_p()
+    advapi.AllocateAndInitializeSid(
+        ctypes.byref(sia), 1,
+        SECURITY_WORLD_RID, 0, 0, 0, 0, 0, 0, 0,
+        ctypes.byref(sid))
+    return sid
+
+
 # ── Process protection ─────────────────────────────────────────────────────────
 
 def _apply_process_protection(pid: int) -> bool:
     """
-    Apply three layers of protection to a newly launched process:
+    Apply two layers of protection to a newly launched process.
 
-    1. DACL hardening — deny PROCESS_VM_READ and PROCESS_QUERY_INFORMATION
-       to everyone except SYSTEM and the process owner. This stops the Jagex
-       client from opening a handle to inspect our process.
+    Layer 1 — DACL with two ACEs:
+      • DENY  Everyone   PROCESS_VM_READ | PROCESS_QUERY_INFORMATION
+      • ALLOW current user  PROCESS_ALL_ACCESS
+    This stops Jagex from peeking into the process while Baby Tank Switcher
+    retains full control so it can still kill / track the process.
 
-    2. Job object isolation — assign the process to a fresh Job Object with
-       UI handle restrictions, breaking the inherited job context and making
-       the process look independently spawned.
+    Layer 2 — Job object isolation (re-parent).
 
-    3. The process was already launched with CREATE_BREAKAWAY_FROM_JOB which
-       detaches it from any job object Baby Tank Switcher is running inside
-       (common when launched from terminals or CI environments).
-
-    Returns True on full success, False if any step failed (non-fatal —
-    the process still runs, just without protection).
+    Returns True on full success; False if any step failed (non-fatal).
     """
     k32    = ctypes.windll.kernel32
     advapi = ctypes.windll.advapi32
@@ -139,48 +189,70 @@ def _apply_process_protection(pid: int) -> bool:
     success = True
 
     try:
-        # ── Step 1: Build a restrictive DACL ──────────────────────────────────
-        # Create an empty (deny-all) DACL then set it on the process object.
-        # We create a new security descriptor with an empty ACL — this effectively
-        # denies all access to any principal not explicitly granted (i.e. SYSTEM
-        # still works via kernel bypass, but userland Jagex code cannot query us).
+        # ── Build a DACL with explicit ACEs ───────────────────────────────────
+        #
+        # We use SetSecurityInfo (advapi32) rather than SetKernelObjectSecurity
+        # because it handles DACL_SECURITY_INFORMATION cleanly and lets us
+        # supply a proper ACL built with Add*Ace helpers.
+        #
+        # ACL layout (order matters — deny before allow):
+        #   [0] ACCESS_DENIED  Everyone  (VM_READ | QUERY_INFORMATION)
+        #   [1] ACCESS_ALLOWED CurrentUser (ALL_ACCESS)
+        #
+        # Sizes:
+        #   ACL header  = 8 bytes
+        #   ACCESS_DENIED_ACE  header (4) + mask (4) + SID (variable)
+        #   ACCESS_ALLOWED_ACE header (4) + mask (4) + SID (variable)
 
-        # Allocate a SECURITY_DESCRIPTOR
-        sd = ctypes.create_string_buffer(256)
-        if not advapi.InitializeSecurityDescriptor(sd, SECURITY_DESCRIPTOR_REVISION):
-            success = False
-        else:
-            # Allocate an empty ACL (minimum size: header only)
-            acl_size = 8  # sizeof(ACL)
-            acl_buf = ctypes.create_string_buffer(acl_size)
-            if not advapi.InitializeAcl(acl_buf, acl_size, ACL_REVISION):
-                success = False
-            else:
-                # Attach the empty DACL to our security descriptor
-                if not advapi.SetSecurityDescriptorDacl(sd, True, acl_buf, False):
+        everyone_sid = _get_everyone_sid()
+        user_sid_buf = _get_current_user_sid()
+
+        if everyone_sid and user_sid_buf:
+            everyone_len = advapi.GetLengthSid(everyone_sid)
+            user_len     = advapi.GetLengthSid(user_sid_buf)
+
+            # Each ACE = 8-byte header+mask + SID bytes
+            acl_size = 8 + (8 + everyone_len) + (8 + user_len)
+            acl_buf  = ctypes.create_string_buffer(acl_size)
+
+            if advapi.InitializeAcl(acl_buf, acl_size, ACL_REVISION):
+                # Deny Everyone first
+                advapi.AddAccessDeniedAce(acl_buf, ACL_REVISION,
+                                          DENY_MASK, everyone_sid)
+                # Allow current user everything
+                advapi.AddAccessAllowedAce(acl_buf, ACL_REVISION,
+                                           PROCESS_ALL_ACCESS, user_sid_buf)
+
+                # SECURITY_INFORMATION flag 4 = DACL_SECURITY_INFORMATION
+                ret = advapi.SetSecurityInfo(
+                    h_process,
+                    SE_KERNEL_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    None,         # owner SID  (unchanged)
+                    None,         # group SID  (unchanged)
+                    acl_buf,      # new DACL
+                    None,         # SACL       (unchanged)
+                )
+                if ret != 0:   # 0 == ERROR_SUCCESS
                     success = False
-                else:
-                    # Apply the security descriptor to the process kernel object
-                    # SetKernelObjectSecurity is simpler than SetSecurityInfo for this
-                    if not k32.SetKernelObjectSecurity(
-                        h_process, DACL_SECURITY_INFORMATION, sd
-                    ):
-                        success = False
+            else:
+                success = False
 
-        # ── Step 2: Job object isolation ──────────────────────────────────────
-        # Create a new Job Object and assign the process to it.
-        # This re-parents the job context so the process no longer looks like
-        # it's in Baby Tank Switcher's process tree.
+            # Free the Everyone SID allocated by AllocateAndInitializeSid
+            advapi.FreeSid(everyone_sid)
+        else:
+            success = False
+
+        # ── Job object isolation ───────────────────────────────────────────────
         h_job = k32.CreateJobObjectW(None, None)
         if h_job:
-            # Apply UI restrictions to the job — limits handle inheritance
             restrictions = JOBOBJECT_BASIC_UI_RESTRICTIONS()
             restrictions.UIRestrictionsClass = JOB_OBJECT_UILIMIT_HANDLES
             k32.SetInformationJobObject(
                 h_job,
                 JobObjectBasicUIRestrictions,
                 ctypes.byref(restrictions),
-                ctypes.sizeof(restrictions)
+                ctypes.sizeof(restrictions),
             )
             if not k32.AssignProcessToJobObject(h_job, h_process):
                 success = False
@@ -205,7 +277,6 @@ def credentials_exist(settings: Settings) -> bool:
 
 
 def import_current_credentials(account: Account, settings: Settings) -> None:
-    """Copy the live credentials.properties into profiles folder for this account."""
     src = get_active_credentials_path(settings)
     if not src.exists():
         raise SwitcherError(
@@ -218,7 +289,6 @@ def import_current_credentials(account: Account, settings: Settings) -> None:
 
 
 def switch_to(account: Account, settings: Settings) -> None:
-    """Overwrite the live credentials.properties with this account's saved copy."""
     src = PROFILES_DIR / account.credentials_file
     if not src.exists():
         raise SwitcherError(
@@ -238,9 +308,6 @@ def launch(account: Account, settings: Settings,
            protect_process: bool = False) -> int:
     """
     Switch credentials then launch the jar. Returns the PID.
-
-    protect_process: if True (and running as admin), applies Windows process
-    hardening to make the child process harder for Jagex to detect/inspect.
     """
     switch_to(account, settings)
 
@@ -260,8 +327,6 @@ def launch(account: Account, settings: Settings,
     cmd += ["-jar", str(jar)]
     cmd += account.client_args.build_args()
 
-    # Always use CREATE_BREAKAWAY_FROM_JOB so the child is not in our job tree.
-    # CREATE_NO_WINDOW keeps it backgrounded.
     creation_flags = subprocess.CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB
 
     proc = subprocess.Popen(
@@ -272,14 +337,21 @@ def launch(account: Account, settings: Settings,
 
     pid = proc.pid
 
-    # Apply additional hardening if requested and we have admin rights
-    if protect_process:
-        if is_admin():
-            _apply_process_protection(pid)
-        # If not admin, silently skip — process still launched fine
-
+    # Apply additional hardening AFTER registering the process so that even if
+    # protection partially fails, we still track the PID correctly.
     ps_proc = psutil.Process(pid)
     _running[account.id] = ps_proc
+
+    if protect_process and is_admin():
+        _apply_process_protection(pid)
+        # Re-open psutil handle after DACL change — the handle psutil cached
+        # internally was opened before the DACL was applied so it remains valid,
+        # but create a fresh one to be safe.
+        try:
+            _running[account.id] = psutil.Process(pid)
+        except psutil.NoSuchProcess:
+            pass
+
     return pid
 
 
