@@ -911,7 +911,8 @@ import urllib.error
 import json as _json
 
 def _is_microbot_plugin(class_name: str) -> bool:
-    return ".microbot." in class_name
+    cn = class_name.lower()
+    return ".microbot." in cn or ".babytank" in cn
 
 _SCAN_PORTS = list(range(7070, 7200))  # 130 ports — supports up to 130 concurrent bots
 
