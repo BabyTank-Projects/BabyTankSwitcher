@@ -3,7 +3,6 @@ config.py - Settings and account storage
 """
 import json
 import os
-import sys
 import uuid
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -14,6 +13,7 @@ PROFILES_DIR = APP_DATA_DIR
 SETTINGS_FILE = APP_DATA_DIR / "settings.json"
 ACCOUNTS_FILE = APP_DATA_DIR / "accounts.json"
 CREDENTIALS_FILENAME = "credentials.properties"
+MANAGED_PLUGINS_FILE = APP_DATA_DIR / "managed_plugins.json"
 
 
 def _detect_runelite_folder() -> str:
@@ -30,16 +30,8 @@ def ensure_dirs():
 
 
 def read_account_name_from_credentials(credentials_path: Path) -> str:
-    """
-    Read the account display name from credentials.properties.
-    Primary source is the credentials file itself, which the Jagex launcher
-    writes directly with a displayName field. Falls back to profiles2 folder.
-    """
-    # Primary: read displayName directly from credentials.properties
-    # The Jagex launcher writes this file and includes the account display name.
     try:
         text = credentials_path.read_text(encoding="utf-8", errors="ignore")
-        # Check keys in priority order - JX_DISPLAY_NAME is what Jagex launcher writes
         for key in ("JX_DISPLAY_NAME", "displayName", "display_name", "accountName",
                     "account_name", "username", "name", "id", "accountId"):
             for line in text.splitlines():
@@ -52,8 +44,6 @@ def read_account_name_from_credentials(credentials_path: Path) -> str:
         pass
 
     runelite_folder = credentials_path.parent
-
-    # Secondary: scan .runelite/profiles2/ for the most recently modified .profile file
     profiles2 = runelite_folder / "profiles2"
     if profiles2.exists():
         try:
@@ -69,7 +59,6 @@ def read_account_name_from_credentials(credentials_path: Path) -> str:
         except Exception:
             pass
 
-    # Tertiary: check inside each .profile for a name= field
     if profiles2.exists():
         try:
             for pfile in sorted(profiles2.glob("*.profile"),
@@ -89,14 +78,38 @@ def read_account_name_from_credentials(credentials_path: Path) -> str:
 
 
 def _looks_like_token(val: str) -> bool:
-    """Return True if the value looks like an auth token rather than a display name."""
-    # Auth tokens are typically long (40+ chars) and contain no spaces
     return len(val) > 40 and " " not in val
+
+
+# ── Managed plugins persistence ────────────────────────────────────────────────
+
+def load_managed_plugins() -> set:
+    """
+    Load managed plugin classNames from disk.
+    Returns empty set by default — all plugins start unmanaged.
+    """
+    try:
+        if MANAGED_PLUGINS_FILE.exists():
+            data = json.loads(MANAGED_PLUGINS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return set(data)
+    except Exception:
+        pass
+    return set()
+
+
+def save_managed_plugins(managed: set):
+    """Persist managed plugin classNames to disk."""
+    try:
+        ensure_dirs()
+        MANAGED_PLUGINS_FILE.write_text(
+            json.dumps(sorted(managed), indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 
 @dataclass
 class ClientArgs:
-    """Per-account client launch arguments."""
     clean_jagex_launcher: bool = False
     developer_mode: bool = False
     debug_mode: bool = False
@@ -135,7 +148,6 @@ class ClientArgs:
         )
 
     def build_args(self) -> list:
-        """Convert to a list of CLI flags."""
         args = []
         if self.clean_jagex_launcher:  args.append("--clean-jagex-launcher")
         if self.developer_mode:        args.append("--developer-mode")
@@ -165,23 +177,23 @@ class Account:
     client_args: ClientArgs = field(default_factory=ClientArgs)
     notes: str = ""
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    http_port: int = 0  # BabyTank HTTP Server port (0 = not configured)
+    http_port: int = 0
+    skip_launch: bool = False  # if True, excluded from Launch All
 
     def to_dict(self):
-        d = {
+        return {
             "display_name": self.display_name,
             "credentials_file": self.credentials_file,
             "client_args": self.client_args.to_dict(),
             "notes": self.notes,
             "id": self.id,
             "http_port": self.http_port,
+            "skip_launch": self.skip_launch,
         }
-        return d
 
     @staticmethod
     def from_dict(d: dict) -> "Account":
         ca = d.get("client_args", {})
-        # backward compat: old runelite_profile field
         if isinstance(ca, dict):
             client_args = ClientArgs.from_dict(ca)
         else:
@@ -195,6 +207,7 @@ class Account:
             notes=d.get("notes", ""),
             id=d.get("id", str(uuid.uuid4())),
             http_port=d.get("http_port", 0),
+            skip_launch=d.get("skip_launch", False),
         )
 
 
@@ -204,7 +217,7 @@ class Settings:
     config_location: str  = field(default_factory=_detect_config_location)
     jar_path: str         = ""
     jvm_args: str         = "-Xmx512m"
-    protect_process: bool = False  # Apply Windows process hardening on launch (requires admin)
+    protect_process: bool = False
 
     def to_dict(self):
         return asdict(self)
